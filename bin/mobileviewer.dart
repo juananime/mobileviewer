@@ -26,22 +26,51 @@ void main(List<String> arguments) async {
     return;
   }
 
-  final scrcpyInstalled = results.any((r) => r.name == 'scrcpy' && r.installed);
+  final emulatorInstalled =
+      results.any((r) => r.name == 'emulator' && r.installed);
+  final scrcpyInstalled =
+      results.any((r) => r.name == 'scrcpy' && r.installed);
 
   print('Checking for connected Android devices...\n');
 
-  final devices = await listConnectedDevices();
+  var devices = await listConnectedDevices();
 
+  // No device connected — offer to start an emulator
   if (devices.isEmpty) {
-    print('No devices connected.');
-    return;
+    if (!emulatorInstalled) {
+      print('No devices connected and emulator tool not found.');
+      return;
+    }
+
+    final avds = await listAvds();
+    if (avds.isEmpty) {
+      print('No devices connected and no AVDs configured.');
+      print('Create one in Android Studio: Tools → AVD Manager.');
+      return;
+    }
+
+    print('No devices connected. Available emulators:\n');
+    for (var i = 0; i < avds.length; i++) {
+      print('  ${i + 1}. ${avds[i]}');
+    }
+    stdout.write('\nSelect emulator to launch [1-${avds.length}]: ');
+    final input = stdin.readLineSync()?.trim() ?? '';
+    final choice = int.tryParse(input);
+    if (choice == null || choice < 1 || choice > avds.length) {
+      print('Invalid selection.');
+      return;
+    }
+
+    print('');
+    final booted = await launchAvd(avds[choice - 1]);
+    devices = [booted];
   }
 
   ConnectedDevice target;
 
   if (devices.length == 1) {
     target = devices.first;
-    print('Found: ${target.label}');
+    print('Target: ${target.label}');
   } else {
     print('Multiple devices connected:');
     for (var i = 0; i < devices.length; i++) {

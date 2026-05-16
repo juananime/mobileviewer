@@ -1,0 +1,42 @@
+appId: com.example.myapp
+---
+- launchApp
+
+- assertVisible: "Welcome"
+
+- tapOn: "Login"
+
+- tapOn:
+    id: "com.example.myapp:id/email_field"
+
+- inputText: "user@example.com"
+
+- pressKey: Tab
+
+- inputText: "mypassword"
+
+- pressKey: Enter
+
+- wait:
+    maxDuration: 2000
+
+- assertVisible: "Home"
+
+- assertNotVisible: "Error"
+
+- takeScreenshot: after_login
+
+- scrollUntilVisible: "Settings"
+
+- tapOn: "Settings"
+
+- swipe:
+    direction: UP
+
+- swipe:
+    start: "50%, 80%"
+    end: "50%, 20%"
+
+- back
+
+- takeScreenshot: final_state
