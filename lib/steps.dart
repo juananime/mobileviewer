@@ -564,9 +564,9 @@ class _StepRunner {
 
       try {
         await _execute(type, params);
-        print('✓');
+        print('\x1B[32m✓\x1B[0m');
       } catch (e) {
-        print('✗\n\nFailed: $e');
+        print('\x1B[31m✗\x1B[0m\n\n\x1B[31mFailed: $e\x1B[0m');
         exit(1);
       }
     }

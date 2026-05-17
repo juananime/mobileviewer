@@ -191,26 +191,31 @@ Future<void> _runIos(String? yamlFile, {String? appPath, bool verbose = false}) 
 
   IosDevice target;
 
-  if (devices.length == 1) {
-    target = devices.first;
-    if (!target.isBooted && target.isSimulator) {
-      target = await bootIosSimulator(target);
-    }
+  final booted = devices.where((d) => d.isBooted).toList();
+
+  if (booted.length == 1) {
+    // Exactly one booted simulator — use it without prompting.
+    target = booted.first;
     print('Target: ${target.label}');
   } else {
-    print('Available iOS devices and simulators:\n');
-    for (var i = 0; i < devices.length; i++) {
-      final booted = devices[i].isBooted ? ' [booted]' : '';
-      print('  ${i + 1}. ${devices[i].label}$booted');
+    // No booted simulators: show full list. Multiple booted: show only those.
+    final candidates = booted.isNotEmpty ? booted : devices;
+    final label = booted.isNotEmpty
+        ? 'Multiple booted simulators found'
+        : 'Available iOS devices and simulators';
+    print('$label:\n');
+    for (var i = 0; i < candidates.length; i++) {
+      final bootedTag = candidates[i].isBooted ? ' [booted]' : '';
+      print('  ${i + 1}. ${candidates[i].label}$bootedTag');
     }
-    stdout.write('\nSelect target [1-${devices.length}]: ');
+    stdout.write('\nSelect target [1-${candidates.length}]: ');
     final input = stdin.readLineSync()?.trim() ?? '';
     final choice = int.tryParse(input);
-    if (choice == null || choice < 1 || choice > devices.length) {
+    if (choice == null || choice < 1 || choice > candidates.length) {
       print('Invalid selection.');
       return;
     }
-    target = devices[choice - 1];
+    target = candidates[choice - 1];
     if (!target.isBooted && target.isSimulator) {
       target = await bootIosSimulator(target);
     }
