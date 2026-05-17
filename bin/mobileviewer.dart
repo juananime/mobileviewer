@@ -3,21 +3,29 @@ import 'package:mobileviewer/mobileviewer.dart';
 import 'package:mobileviewer/steps.dart';
 
 void main(List<String> arguments) async {
+  final isIos = arguments.contains('--ios');
+  final positional =
+      arguments.where((a) => !a.startsWith('--')).toList();
+  final yamlFile =
+      positional.firstWhere((a) => a.endsWith('.yaml'), orElse: () => '');
+
+  if (isIos) {
+    await _runIos(yamlFile.isNotEmpty ? yamlFile : null);
+  } else {
+    await _runAndroid(yamlFile.isNotEmpty ? yamlFile : null);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Android flow
+// ---------------------------------------------------------------------------
+
+Future<void> _runAndroid(String? yamlFile) async {
+  print('Platform: Android\n');
   print('Checking Android development tools...\n');
 
   final results = await checkAndroidTools();
-
-  for (final result in results) {
-    if (result.installed) {
-      print('[✓] ${result.name}');
-      if (result.path != null) print('    Path:    ${result.path}');
-      if (result.version != null) print('    Version: ${result.version}');
-    } else {
-      print('[✗] ${result.name} — not found');
-      if (result.error != null) print('    Error: ${result.error}');
-    }
-    print('');
-  }
+  _printToolResults(results);
 
   final adbInstalled = results.any((r) => r.name == 'adb' && r.installed);
   if (!adbInstalled) {
@@ -35,7 +43,6 @@ void main(List<String> arguments) async {
 
   var devices = await listConnectedDevices();
 
-  // No device connected — offer to start an emulator
   if (devices.isEmpty) {
     if (!emulatorInstalled) {
       print('No devices connected and emulator tool not found.');
@@ -88,9 +95,8 @@ void main(List<String> arguments) async {
 
   print('');
 
-  // If a YAML file is provided, run the e2e steps
-  if (arguments.isNotEmpty && arguments.first.endsWith('.yaml')) {
-    await runStepsFile(arguments.first, target.id);
+  if (yamlFile != null) {
+    await runStepsFile(yamlFile, target.id);
     return;
   }
 
@@ -101,4 +107,88 @@ void main(List<String> arguments) async {
   }
 
   await openDeviceViewer(target);
+}
+
+// ---------------------------------------------------------------------------
+// iOS flow
+// ---------------------------------------------------------------------------
+
+Future<void> _runIos(String? yamlFile) async {
+  print('Platform: iOS\n');
+  print('Checking iOS development tools...\n');
+
+  final results = await checkIosTools();
+  _printToolResults(results);
+
+  final xcrunInstalled = results.any((r) => r.name == 'xcrun' && r.installed);
+  if (!xcrunInstalled) {
+    print('xcrun is required for iOS automation.');
+    print('Install Xcode from the Mac App Store, then run:');
+    print('  xcode-select --install');
+    return;
+  }
+
+  print('Checking for iOS simulators...\n');
+
+  var devices = await listIosDevices();
+
+  if (devices.isEmpty) {
+    print('No iOS devices or simulators found.');
+    print('Make sure Xcode is installed and simulators are configured.');
+    return;
+  }
+
+  IosDevice target;
+
+  if (devices.length == 1) {
+    target = devices.first;
+    if (!target.isBooted && target.isSimulator) {
+      target = await bootIosSimulator(target);
+    }
+    print('Target: ${target.label}');
+  } else {
+    print('Available iOS devices and simulators:\n');
+    for (var i = 0; i < devices.length; i++) {
+      final booted = devices[i].isBooted ? ' [booted]' : '';
+      print('  ${i + 1}. ${devices[i].label}$booted');
+    }
+    stdout.write('\nSelect target [1-${devices.length}]: ');
+    final input = stdin.readLineSync()?.trim() ?? '';
+    final choice = int.tryParse(input);
+    if (choice == null || choice < 1 || choice > devices.length) {
+      print('Invalid selection.');
+      return;
+    }
+    target = devices[choice - 1];
+    if (!target.isBooted && target.isSimulator) {
+      target = await bootIosSimulator(target);
+    }
+  }
+
+  print('');
+
+  if (yamlFile != null) {
+    await runStepsFile(yamlFile, target.udid, ios: true);
+    return;
+  }
+
+  await openIosSimulatorViewer();
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+void _printToolResults(List<ToolCheckResult> results) {
+  for (final result in results) {
+    if (result.installed) {
+      print('[✓] ${result.name}');
+      if (result.path != null) print('    Path:    ${result.path}');
+      if (result.version != null) print('    Version: ${result.version}');
+    } else {
+      print('[✗] ${result.name} — not found');
+      if (result.error != null) print('    Error: ${result.error}');
+    }
+    print('');
+  }
 }

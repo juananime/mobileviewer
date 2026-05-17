@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:yaml/yaml.dart';
 
@@ -5,7 +7,8 @@ import 'package:yaml/yaml.dart';
 // Entry point
 // ---------------------------------------------------------------------------
 
-Future<void> runStepsFile(String filePath, String deviceId) async {
+Future<void> runStepsFile(String filePath, String deviceId,
+    {bool ios = false}) async {
   final file = File(filePath);
   if (!await file.exists()) {
     print('Error: file not found — $filePath');
@@ -30,24 +33,474 @@ Future<void> runStepsFile(String filePath, String deviceId) async {
     return;
   }
 
-  final runner = _StepRunner(deviceId: deviceId, appId: appId);
+  final _Driver driver = ios
+      ? _IosXCTestDriver(udid: deviceId)
+      : _AndroidDriver(deviceId: deviceId);
 
-  print('Flow:  $filePath');
-  if (appId != null) print('App:   $appId');
-  print('Steps: ${steps.length}\n');
+  final runner = _StepRunner(driver: driver, appId: appId, ios: ios);
 
-  await runner.runSteps(steps);
+  print('Flow:     $filePath');
+  print('Platform: ${ios ? 'iOS' : 'Android'}');
+  if (appId != null) print('App:      $appId');
+  print('Steps:    ${steps.length}\n');
+
+  try {
+    await runner.runSteps(steps);
+  } finally {
+    await driver.dispose();
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Runner
+// Abstract driver
+// ---------------------------------------------------------------------------
+
+abstract class _Driver {
+  Future<void> launchApp(String bundleId);
+  Future<void> stopApp(String bundleId);
+  Future<void> clearState(String bundleId);
+
+  Future<void> tap(int x, int y);
+  Future<void> longPress(int x, int y);
+  Future<void> doubleTap(int x, int y);
+  Future<void> swipe(int x1, int y1, int x2, int y2, int durationMs);
+  Future<void> inputText(String text);
+  Future<void> clearText();
+  Future<void> hideKeyboard();
+  Future<void> pressKey(String key);
+  Future<void> openLink(String url);
+  Future<void> back();
+
+  Future<(int, int)?> findElementByText(String text);
+  Future<(int, int)?> findElementById(String id);
+
+  Future<void> takeScreenshot(String path);
+  Future<(int, int)> getScreenSize();
+
+  Future<void> dispose() async {}
+}
+
+// ---------------------------------------------------------------------------
+// Android driver (adb + uiautomator)
+// ---------------------------------------------------------------------------
+
+class _AndroidDriver implements _Driver {
+  final String deviceId;
+
+  _AndroidDriver({required this.deviceId});
+
+  @override
+  Future<void> launchApp(String bundleId) =>
+      _adb(['shell', 'monkey', '-p', bundleId, '-c',
+          'android.intent.category.LAUNCHER', '1']);
+
+  @override
+  Future<void> stopApp(String bundleId) =>
+      _adb(['shell', 'am', 'force-stop', bundleId]);
+
+  @override
+  Future<void> clearState(String bundleId) =>
+      _adb(['shell', 'pm', 'clear', bundleId]);
+
+  @override
+  Future<void> tap(int x, int y) =>
+      _adb(['shell', 'input', 'tap', '$x', '$y']);
+
+  @override
+  Future<void> longPress(int x, int y) =>
+      _adb(['shell', 'input', 'swipe', '$x', '$y', '$x', '$y', '800']);
+
+  @override
+  Future<void> doubleTap(int x, int y) async {
+    await _adb(['shell', 'input', 'tap', '$x', '$y']);
+    await Future.delayed(const Duration(milliseconds: 80));
+    await _adb(['shell', 'input', 'tap', '$x', '$y']);
+  }
+
+  @override
+  Future<void> swipe(int x1, int y1, int x2, int y2, int durationMs) =>
+      _adb(['shell', 'input', 'swipe',
+          '$x1', '$y1', '$x2', '$y2', '$durationMs']);
+
+  @override
+  Future<void> inputText(String text) =>
+      _adb(['shell', 'input', 'text', text.replaceAll(' ', '%s')]);
+
+  @override
+  Future<void> clearText() async {
+    await _adb(['shell', 'input', 'keyevent', '--longpress', 'KEYCODE_A']);
+    await _adb(['shell', 'input', 'keyevent', 'KEYCODE_DEL']);
+  }
+
+  @override
+  Future<void> hideKeyboard() =>
+      _adb(['shell', 'input', 'keyevent', 'KEYCODE_BACK']);
+
+  @override
+  Future<void> pressKey(String key) =>
+      _adb(['shell', 'input', 'keyevent', _androidKeycode(key)]);
+
+  @override
+  Future<void> openLink(String url) =>
+      _adb(['shell', 'am', 'start', '-a', 'android.intent.action.VIEW',
+          '-d', url]);
+
+  @override
+  Future<void> back() =>
+      _adb(['shell', 'input', 'keyevent', 'KEYCODE_BACK']);
+
+  @override
+  Future<void> takeScreenshot(String path) async {
+    final result = await Process.run(
+      'adb', ['-s', deviceId, 'exec-out', 'screencap', '-p'],
+      stdoutEncoding: null,
+    );
+    await File(path).writeAsBytes(result.stdout as List<int>);
+  }
+
+  @override
+  Future<(int, int)?> findElementByText(String text) async {
+    final xml = await _dumpUi();
+    if (xml == null) return null;
+    return _parseAndroidBounds(xml, text: text);
+  }
+
+  @override
+  Future<(int, int)?> findElementById(String id) async {
+    final xml = await _dumpUi();
+    if (xml == null) return null;
+    return _parseAndroidBounds(xml, resourceId: id);
+  }
+
+  (int, int)? _screenSize;
+
+  @override
+  Future<(int, int)> getScreenSize() async {
+    if (_screenSize != null) return _screenSize!;
+    final result = await Process.run(
+        'adb', ['-s', deviceId, 'shell', 'wm', 'size']);
+    final match = RegExp(r'(\d+)x(\d+)')
+        .firstMatch((result.stdout as String).trim());
+    if (match == null) throw 'Could not determine Android screen size';
+    _screenSize = (int.parse(match.group(1)!), int.parse(match.group(2)!));
+    return _screenSize!;
+  }
+
+  Future<String?> _dumpUi() async {
+    await _adb(['shell', 'uiautomator', 'dump', '/sdcard/_ui_dump.xml']);
+    final result = await Process.run(
+        'adb', ['-s', deviceId, 'shell', 'cat', '/sdcard/_ui_dump.xml']);
+    return result.stdout as String;
+  }
+
+  (int, int)? _parseAndroidBounds(String xml,
+      {String? text, String? resourceId}) {
+    final nodePattern = RegExp(r'<node [^/]*/?>');
+    for (final nodeMatch in nodePattern.allMatches(xml)) {
+      final node = nodeMatch.group(0)!;
+      bool matches = false;
+      if (text != null) {
+        matches =
+            node.contains('text="$text"') ||
+            node.contains('content-desc="$text"');
+      } else if (resourceId != null) {
+        matches = node.contains('resource-id="$resourceId"');
+      }
+      if (!matches) continue;
+      final boundsMatch =
+          RegExp(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"').firstMatch(node);
+      if (boundsMatch != null) {
+        final x1 = int.parse(boundsMatch.group(1)!);
+        final y1 = int.parse(boundsMatch.group(2)!);
+        final x2 = int.parse(boundsMatch.group(3)!);
+        final y2 = int.parse(boundsMatch.group(4)!);
+        return ((x1 + x2) ~/ 2, (y1 + y2) ~/ 2);
+      }
+    }
+    return null;
+  }
+
+  @override
+  Future<void> dispose() async {}
+
+  Future<void> _adb(List<String> args) async {
+    final result = await Process.run('adb', ['-s', deviceId, ...args]);
+    if (result.exitCode != 0) {
+      final err = (result.stderr as String).trim();
+      throw err.isNotEmpty ? err : 'adb exited with code ${result.exitCode}';
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// iOS driver — XCTest runner over TCP + xcrun simctl for lifecycle
+// ---------------------------------------------------------------------------
+
+class _IosXCTestDriver implements _Driver {
+  final String udid;
+  static const _port = 22087;
+
+  Socket? _socket;
+  _LineReader? _reader;
+  Process? _runnerProcess;
+
+  _IosXCTestDriver({required this.udid});
+
+  // ---- connection management ----
+
+  Future<void> _ensureConnected() async {
+    if (_socket != null) return;
+    await _startRunner();
+    final connected = await _connectWithRetry();
+    _socket = connected.$1;
+    _reader = connected.$2;
+    // Tell runner which app we're targeting (bundle ID stored per-command)
+  }
+
+  Future<void> _startRunner() async {
+    final buildDir = _buildDir();
+    var xctestrun = _findXctestrun(buildDir);
+    if (xctestrun == null) {
+      await _buildRunner(buildDir);
+      xctestrun = _findXctestrun(buildDir);
+      if (xctestrun == null) {
+        throw 'XCTest runner build failed — no .xctestrun found in $buildDir';
+      }
+    }
+    _runnerProcess = await Process.start('xcodebuild', [
+      'test-without-building',
+      '-xctestrun', xctestrun,
+      '-destination', 'id=$udid',
+    ]);
+    _runnerProcess!.stdout.drain<void>();
+    _runnerProcess!.stderr.drain<void>();
+  }
+
+  static Future<void> _buildRunner(String buildDir) async {
+    final cwd = Directory.current.path;
+    final buildScript = '$cwd/xctest-runner/build.sh';
+    if (!File(buildScript).existsSync()) {
+      throw 'Could not find xctest-runner/build.sh.\n'
+          'Make sure you run the CLI from the project root.';
+    }
+    print('XCTest runner not built — building now...');
+    final result = await Process.run('bash', [buildScript],
+        workingDirectory: cwd);
+    if (result.exitCode != 0) {
+      throw 'XCTest runner build failed:\n${result.stderr}';
+    }
+    print('XCTest runner ready.\n');
+  }
+
+  Future<(Socket, _LineReader)> _connectWithRetry() async {
+    for (var i = 0; i < 30; i++) {
+      try {
+        final s = await Socket.connect(
+            InternetAddress.loopbackIPv4, _port,
+            timeout: const Duration(seconds: 1));
+        final r = _LineReader(s);
+        return (s, r);
+      } catch (_) {
+        await Future.delayed(const Duration(milliseconds: 500));
+      }
+    }
+    throw 'Could not connect to XCTest runner on port $_port after 15 s.\n'
+        'Check that the runner built successfully and the simulator is booted.';
+  }
+
+  Future<Map<String, dynamic>> _send(Map<String, dynamic> cmd) async {
+    await _ensureConnected();
+    _socket!.write('${jsonEncode(cmd)}\n');
+    final line = await _reader!.readLine();
+    final resp = jsonDecode(line) as Map<String, dynamic>;
+    if (resp['ok'] != true) throw resp['error'] ?? 'runner error';
+    return resp;
+  }
+
+  @override
+  Future<void> dispose() async {
+    try { await _send({'type': 'quit'}); } catch (_) {}
+    _socket?.destroy();
+    _runnerProcess?.kill();
+  }
+
+  // ---- _Driver implementation ----
+
+  @override
+  Future<void> launchApp(String bundleId) =>
+      _send({'type': 'launchApp', 'bundleId': bundleId});
+
+  @override
+  Future<void> stopApp(String bundleId) =>
+      _send({'type': 'stopApp', 'bundleId': bundleId});
+
+  @override
+  Future<void> clearState(String bundleId) async {
+    try { await stopApp(bundleId); } catch (_) {}
+    // Delete the simulator data container (simulator only)
+    final r = await Process.run('xcrun',
+        ['simctl', 'get_app_container', udid, bundleId, 'data']);
+    final path = (r.stdout as String).trim();
+    if (path.isNotEmpty) await Process.run('rm', ['-rf', path]);
+  }
+
+  @override
+  Future<void> tap(int x, int y) =>
+      _send({'type': 'tap', 'x': x.toDouble(), 'y': y.toDouble()});
+
+  @override
+  Future<void> longPress(int x, int y) =>
+      _send({'type': 'longPress', 'x': x.toDouble(), 'y': y.toDouble()});
+
+  @override
+  Future<void> doubleTap(int x, int y) =>
+      _send({'type': 'doubleTap', 'x': x.toDouble(), 'y': y.toDouble()});
+
+  @override
+  Future<void> swipe(int x1, int y1, int x2, int y2, int durationMs) =>
+      _send({
+        'type': 'swipe',
+        'x1': x1.toDouble(), 'y1': y1.toDouble(),
+        'x2': x2.toDouble(), 'y2': y2.toDouble(),
+        'duration': durationMs / 1000.0,
+      });
+
+  @override
+  Future<void> inputText(String text) =>
+      _send({'type': 'inputText', 'text': text});
+
+  @override
+  Future<void> clearText() => _send({'type': 'clearText'});
+
+  @override
+  Future<void> hideKeyboard() => _send({'type': 'hideKeyboard'});
+
+  @override
+  Future<void> pressKey(String key) =>
+      _send({'type': 'pressKey', 'key': key});
+
+  @override
+  Future<void> openLink(String url) =>
+      _send({'type': 'openLink', 'url': url});
+
+  @override
+  Future<void> back() => _send({'type': 'back'});
+
+  @override
+  Future<void> takeScreenshot(String path) async {
+    final resp = await _send({'type': 'screenshot'});
+    final bytes = base64Decode(resp['data'] as String);
+    await File(path).writeAsBytes(bytes);
+  }
+
+  @override
+  Future<(int, int)?> findElementByText(String text) async {
+    try {
+      final r = await _send({'type': 'findByText', 'text': text});
+      return ((r['x'] as num).round(), (r['y'] as num).round());
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  Future<(int, int)?> findElementById(String id) async {
+    try {
+      final r = await _send({'type': 'findById', 'id': id});
+      return ((r['x'] as num).round(), (r['y'] as num).round());
+    } catch (_) {
+      return null;
+    }
+  }
+
+  (int, int)? _screenSize;
+
+  @override
+  Future<(int, int)> getScreenSize() async {
+    if (_screenSize != null) return _screenSize!;
+    final r = await _send({'type': 'screenSize'});
+    _screenSize = (
+      (r['width'] as num).round(),
+      (r['height'] as num).round(),
+    );
+    return _screenSize!;
+  }
+
+  // ---- helpers ----
+
+  static String _buildDir() {
+    // Resolve relative to where the CLI is invoked from
+    final cwd = Directory.current.path;
+    return '$cwd/.build/xctest';
+  }
+
+  static String? _findXctestrun(String buildDir) {
+    final dir = Directory(buildDir);
+    if (!dir.existsSync()) return null;
+    final hits = dir
+        .listSync(recursive: true)
+        .whereType<File>()
+        .where((f) => f.path.endsWith('.xctestrun'))
+        .toList();
+    return hits.isEmpty ? null : hits.first.path;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TCP line reader (single-listener, request-response safe)
+// ---------------------------------------------------------------------------
+
+class _LineReader {
+  final _buf = StringBuffer();
+  final _pending = <Completer<String>>[];
+  final _lines = <String>[];
+
+  _LineReader(Socket socket) {
+    socket.listen((data) {
+      _buf.write(utf8.decode(data));
+      _flush();
+    });
+  }
+
+  void _flush() {
+    final s = _buf.toString();
+    var start = 0;
+    for (var i = 0; i < s.length; i++) {
+      if (s[i] == '\n') {
+        _deliver(s.substring(start, i));
+        start = i + 1;
+      }
+    }
+    _buf.clear();
+    _buf.write(s.substring(start));
+  }
+
+  void _deliver(String line) {
+    if (_pending.isNotEmpty) {
+      _pending.removeAt(0).complete(line);
+    } else {
+      _lines.add(line);
+    }
+  }
+
+  Future<String> readLine() {
+    if (_lines.isNotEmpty) return Future.value(_lines.removeAt(0));
+    final c = Completer<String>();
+    _pending.add(c);
+    return c.future;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step runner
 // ---------------------------------------------------------------------------
 
 class _StepRunner {
-  final String deviceId;
+  final _Driver driver;
   final String? appId;
+  final bool ios;
 
-  _StepRunner({required this.deviceId, this.appId});
+  _StepRunner({required this.driver, this.appId, required this.ios});
 
   Future<void> runSteps(YamlList steps) async {
     for (var i = 0; i < steps.length; i++) {
@@ -56,7 +509,6 @@ class _StepRunner {
       dynamic params;
 
       if (raw is String) {
-        // e.g. "- launchApp" or "- back"
         type = raw;
         params = null;
       } else if (raw is YamlMap) {
@@ -90,22 +542,21 @@ class _StepRunner {
             ? params
             : (params is YamlMap ? params['appId'] as String? : null) ?? appId;
         if (pkg == null) throw 'launchApp requires an appId';
-        await _adb(['shell', 'monkey', '-p', pkg, '-c',
-            'android.intent.category.LAUNCHER', '1']);
+        await driver.launchApp(pkg);
 
       case 'stopApp':
         final pkg = params is String ? params : appId;
         if (pkg == null) throw 'stopApp requires an appId';
-        await _adb(['shell', 'am', 'force-stop', pkg]);
+        await driver.stopApp(pkg);
 
       case 'clearState':
         final pkg = params is String ? params : appId;
         if (pkg == null) throw 'clearState requires an appId';
-        await _adb(['shell', 'pm', 'clear', pkg]);
+        await driver.clearState(pkg);
 
       // --- Navigation ---
       case 'back':
-        await _adb(['shell', 'input', 'keyevent', 'KEYCODE_BACK']);
+        await driver.back();
 
       case 'scroll':
         final dir = params is YamlMap
@@ -129,9 +580,7 @@ class _StepRunner {
 
       case 'doubleTapOn':
         final (x, y) = await _resolveTarget(params);
-        await _adb(['shell', 'input', 'tap', '$x', '$y']);
-        await Future.delayed(const Duration(milliseconds: 80));
-        await _adb(['shell', 'input', 'tap', '$x', '$y']);
+        await driver.doubleTap(x, y);
 
       case 'swipe':
         if (params is YamlMap && params.containsKey('direction')) {
@@ -142,45 +591,39 @@ class _StepRunner {
             params.containsKey('end')) {
           final (x1, y1) = await _resolvePoint(params['start'] as String);
           final (x2, y2) = await _resolvePoint(params['end'] as String);
-          final duration = params['duration'] ?? 400;
-          await _adb(['shell', 'input', 'swipe',
-              '$x1', '$y1', '$x2', '$y2', '$duration']);
+          final duration = (params['duration'] as int?) ?? 400;
+          await driver.swipe(x1, y1, x2, y2, duration);
         } else {
           throw 'swipe requires direction or start/end';
         }
 
       case 'inputText':
         final text = params is String ? params : params['text'] as String;
-        final escaped = text.replaceAll(' ', '%s');
-        await _adb(['shell', 'input', 'text', escaped]);
+        await driver.inputText(text);
 
       case 'clearText':
-        // Select all then delete
-        await _adb(['shell', 'input', 'keyevent',
-            '--longpress', 'KEYCODE_A']);
-        await _adb(['shell', 'input', 'keyevent', 'KEYCODE_DEL']);
+        await driver.clearText();
 
       case 'hideKeyboard':
-        await _adb(['shell', 'input', 'keyevent', 'KEYCODE_BACK']);
+        await driver.hideKeyboard();
 
       case 'pressKey':
         final key = params is String ? params : params['key'] as String;
-        await _adb(['shell', 'input', 'keyevent', _keycode(key)]);
+        await driver.pressKey(key);
 
       case 'openLink':
         final url = params is String ? params : params['url'] as String;
-        await _adb(['shell', 'am', 'start', '-a',
-            'android.intent.action.VIEW', '-d', url]);
+        await driver.openLink(url);
 
       // --- Assertions ---
       case 'assertVisible':
         final text = params is String ? params : params['text'] as String;
-        final found = await _findElementByText(text);
+        final found = await driver.findElementByText(text);
         if (found == null) throw 'Element not visible: "$text"';
 
       case 'assertNotVisible':
         final text = params is String ? params : params['text'] as String;
-        final found = await _findElementByText(text);
+        final found = await driver.findElementByText(text);
         if (found != null) throw 'Element should not be visible: "$text"';
 
       // --- Utilities ---
@@ -190,11 +633,7 @@ class _StepRunner {
             : (params is YamlMap ? params['path'] as String? : null) ??
                 'screenshot';
         final path = name.endsWith('.png') ? name : '$name.png';
-        final result = await Process.run(
-          'adb', ['-s', deviceId, 'exec-out', 'screencap', '-p'],
-          stdoutEncoding: null,
-        );
-        await File(path).writeAsBytes(result.stdout as List<int>);
+        await driver.takeScreenshot(path);
 
       case 'wait':
         final ms = params is YamlMap
@@ -216,7 +655,12 @@ class _StepRunner {
 
       case 'runFlow':
         final path = params is String ? params : params['file'] as String;
-        await runStepsFile(path, deviceId);
+        final deviceId = switch (driver) {
+          _AndroidDriver d => d.deviceId,
+          _IosXCTestDriver d => d.udid,
+          _ => throw 'Unknown driver type',
+        };
+        await runStepsFile(path, deviceId, ios: ios);
 
       default:
         throw 'Unknown step: "$type"';
@@ -224,114 +668,33 @@ class _StepRunner {
   }
 
   // ---------------------------------------------------------------------------
-  // Element finding via uiautomator
-  // ---------------------------------------------------------------------------
-
-  Future<String?> _dumpUi() async {
-    await _adb(['shell', 'uiautomator', 'dump', '/sdcard/_ui_dump.xml']);
-    final result = await Process.run(
-      'adb', ['-s', deviceId, 'shell', 'cat', '/sdcard/_ui_dump.xml'],
-    );
-    return result.stdout as String;
-  }
-
-  Future<(int, int)?> _findElementByText(String text) async {
-    final xml = await _dumpUi();
-    if (xml == null) return null;
-
-    // Match text="..." or content-desc="..."
-    final pattern = RegExp(
-      r'<node[^>]*(?:text|content-desc)="' +
-          RegExp.escape(text) +
-          r'"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
-    );
-    // Also try reversed attribute order
-    final pattern2 = RegExp(
-      r'<node[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"[^>]*(?:text|content-desc)="' +
-          RegExp.escape(text) +
-          r'"',
-    );
-
-    Match? match = pattern.firstMatch(xml) ?? pattern2.firstMatch(xml);
-
-    // Fallback: find bounds near text anywhere in the node string
-    if (match == null) {
-      final nodePattern = RegExp(r'<node [^/]*/?>');
-      for (final nodeMatch in nodePattern.allMatches(xml)) {
-        final node = nodeMatch.group(0)!;
-        if (node.contains('text="$text"') ||
-            node.contains('content-desc="$text"')) {
-          final boundsMatch =
-              RegExp(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
-                  .firstMatch(node);
-          if (boundsMatch != null) {
-            match = boundsMatch;
-            break;
-          }
-        }
-      }
-    }
-
-    if (match == null) return null;
-    final x1 = int.parse(match.group(1)!);
-    final y1 = int.parse(match.group(2)!);
-    final x2 = int.parse(match.group(3)!);
-    final y2 = int.parse(match.group(4)!);
-    return ((x1 + x2) ~/ 2, (y1 + y2) ~/ 2);
-  }
-
-  Future<(int, int)?> _findElementById(String resourceId) async {
-    final xml = await _dumpUi();
-    if (xml == null) return null;
-
-    final nodePattern = RegExp(r'<node [^/]*/?>');
-    for (final nodeMatch in nodePattern.allMatches(xml)) {
-      final node = nodeMatch.group(0)!;
-      if (node.contains('resource-id="$resourceId"')) {
-        final boundsMatch =
-            RegExp(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
-                .firstMatch(node);
-        if (boundsMatch != null) {
-          final x1 = int.parse(boundsMatch.group(1)!);
-          final y1 = int.parse(boundsMatch.group(2)!);
-          final x2 = int.parse(boundsMatch.group(3)!);
-          final y2 = int.parse(boundsMatch.group(4)!);
-          return ((x1 + x2) ~/ 2, (y1 + y2) ~/ 2);
-        }
-      }
-    }
-    return null;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Tap helpers
+  // Higher-level helpers (built on driver primitives)
   // ---------------------------------------------------------------------------
 
   Future<void> _tapOn(dynamic params, {bool longPress = false}) async {
     final (x, y) = await _resolveTarget(params);
     if (longPress) {
-      await _adb(['shell', 'input', 'swipe',
-          '$x', '$y', '$x', '$y', '800']);
+      await driver.longPress(x, y);
     } else {
-      await _adb(['shell', 'input', 'tap', '$x', '$y']);
+      await driver.tap(x, y);
     }
   }
 
   Future<(int, int)> _resolveTarget(dynamic params) async {
     if (params is String) {
-      final pos = await _findElementByText(params);
+      final pos = await driver.findElementByText(params);
       if (pos == null) throw 'Element not found: "$params"';
       return pos;
     }
 
     if (params is YamlMap) {
       if (params.containsKey('id')) {
-        final pos = await _findElementById(params['id'] as String);
+        final pos = await driver.findElementById(params['id'] as String);
         if (pos == null) throw 'Element not found by id: "${params['id']}"';
         return pos;
       }
       if (params.containsKey('text')) {
-        final pos = await _findElementByText(params['text'] as String);
+        final pos = await driver.findElementByText(params['text'] as String);
         if (pos == null) throw 'Element not found: "${params['text']}"';
         return pos;
       }
@@ -343,30 +706,12 @@ class _StepRunner {
     throw 'tapOn requires text, id, or point';
   }
 
-  // ---------------------------------------------------------------------------
-  // Screen size & coordinate helpers
-  // ---------------------------------------------------------------------------
-
-  (int, int)? _screenSize;
-
-  Future<(int, int)> _getScreenSize() async {
-    if (_screenSize != null) return _screenSize!;
-    final result = await Process.run(
-        'adb', ['-s', deviceId, 'shell', 'wm', 'size']);
-    final output = (result.stdout as String).trim();
-    final match = RegExp(r'(\d+)x(\d+)').firstMatch(output);
-    if (match == null) throw 'Could not determine screen size';
-    _screenSize = (int.parse(match.group(1)!), int.parse(match.group(2)!));
-    return _screenSize!;
-  }
-
   Future<(int, int)> _resolvePoint(String point) async {
-    // "50%, 80%" or "540, 800"
     final parts = point.split(',').map((s) => s.trim()).toList();
     if (parts.length != 2) throw 'Invalid point: $point';
 
     if (parts[0].endsWith('%') || parts[1].endsWith('%')) {
-      final (w, h) = await _getScreenSize();
+      final (w, h) = await driver.getScreenSize();
       final px = double.parse(parts[0].replaceAll('%', '')) / 100;
       final py = double.parse(parts[1].replaceAll('%', '')) / 100;
       return ((w * px).round(), (h * py).round());
@@ -376,7 +721,7 @@ class _StepRunner {
   }
 
   Future<void> _swipeDirection(String direction, {bool slow = false}) async {
-    final (w, h) = await _getScreenSize();
+    final (w, h) = await driver.getScreenSize();
     final cx = w ~/ 2;
     final duration = slow ? 600 : 300;
 
@@ -388,63 +733,52 @@ class _StepRunner {
       _       => throw 'Unknown swipe direction: $direction',
     };
 
-    await _adb(['shell', 'input', 'swipe',
-        '${coords.$1}', '${coords.$2}',
-        '${coords.$3}', '${coords.$4}',
-        '$duration']);
+    await driver.swipe(
+        coords.$1, coords.$2, coords.$3, coords.$4, duration);
   }
 
   Future<void> _scrollUntilVisible(String text,
       {int maxScrolls = 10}) async {
     for (var i = 0; i < maxScrolls; i++) {
-      final pos = await _findElementByText(text);
+      final pos = await driver.findElementByText(text);
       if (pos != null) return;
       await _swipeDirection('UP', slow: true);
       await Future.delayed(const Duration(milliseconds: 400));
     }
     throw 'Element never became visible after $maxScrolls scrolls: "$text"';
   }
+}
 
-  // ---------------------------------------------------------------------------
-  // ADB helper
-  // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Key code tables
+// ---------------------------------------------------------------------------
 
-  Future<void> _adb(List<String> args) async {
-    final result =
-        await Process.run('adb', ['-s', deviceId, ...args]);
-    if (result.exitCode != 0) {
-      final err = (result.stderr as String).trim();
-      throw err.isNotEmpty ? err : 'adb exited with code ${result.exitCode}';
-    }
-  }
+String _androidKeycode(String key) {
+  const keycodes = {
+    'enter':       'KEYCODE_ENTER',
+    'back':        'KEYCODE_BACK',
+    'home':        'KEYCODE_HOME',
+    'tab':         'KEYCODE_TAB',
+    'delete':      'KEYCODE_DEL',
+    'backspace':   'KEYCODE_DEL',
+    'menu':        'KEYCODE_MENU',
+    'search':      'KEYCODE_SEARCH',
+    'up':          'KEYCODE_DPAD_UP',
+    'down':        'KEYCODE_DPAD_DOWN',
+    'left':        'KEYCODE_DPAD_LEFT',
+    'right':       'KEYCODE_DPAD_RIGHT',
+    'power':       'KEYCODE_POWER',
+    'volume_up':   'KEYCODE_VOLUME_UP',
+    'volume_down': 'KEYCODE_VOLUME_DOWN',
+    'space':       'KEYCODE_SPACE',
+    'escape':      'KEYCODE_ESCAPE',
+  };
+  return keycodes[key.toLowerCase()] ?? key;
 }
 
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
-
-String _keycode(String key) {
-  const keycodes = {
-    'enter':        'KEYCODE_ENTER',
-    'back':         'KEYCODE_BACK',
-    'home':         'KEYCODE_HOME',
-    'tab':          'KEYCODE_TAB',
-    'delete':       'KEYCODE_DEL',
-    'backspace':    'KEYCODE_DEL',
-    'menu':         'KEYCODE_MENU',
-    'search':       'KEYCODE_SEARCH',
-    'up':           'KEYCODE_DPAD_UP',
-    'down':         'KEYCODE_DPAD_DOWN',
-    'left':         'KEYCODE_DPAD_LEFT',
-    'right':        'KEYCODE_DPAD_RIGHT',
-    'power':        'KEYCODE_POWER',
-    'volume_up':    'KEYCODE_VOLUME_UP',
-    'volume_down':  'KEYCODE_VOLUME_DOWN',
-    'space':        'KEYCODE_SPACE',
-    'escape':       'KEYCODE_ESCAPE',
-  };
-  return keycodes[key.toLowerCase()] ?? key;
-}
 
 String _stepLabel(String type, dynamic params) {
   if (params == null) return type;
