@@ -34,9 +34,34 @@ xcodebuild build-for-testing \
     -derivedDataPath "$BUILD_DIR" \
     CODE_SIGNING_ALLOWED=NO \
     CODE_SIGN_IDENTITY="" \
-    CODE_SIGNING_REQUIRED=NO \
-    -quiet
+    CODE_SIGNING_REQUIRED=NO
 
 XCTESTRUN=$(find "$BUILD_DIR" -name "*.xctestrun" | head -1)
 echo "Build complete."
 echo "Test run file: $XCTESTRUN"
+
+# XCTest requires UITargetAppPath even when UseUITargetAppProvidedByTests=true.
+# Without it the framework throws "No target application path specified via
+# test configuration" before any test code runs.  We point it at the Runner
+# app itself (already installed as the test host); the app is never launched
+# as a UI target because UseUITargetAppProvidedByTests=true.
+echo "Patching xctestrun: injecting UITargetAppPath..."
+PKEY=":TestConfigurations:0:TestTargets:0"
+RUNNER_APP="__TESTROOT__/Debug-iphonesimulator/MobileViewerRunner-Runner.app"
+RUNNER_BID="io.mobileviewer.runner.xctrunner"
+
+/usr/libexec/PlistBuddy \
+    -c "Add ${PKEY}:UITargetAppPath string ${RUNNER_APP}" \
+    "$XCTESTRUN" 2>/dev/null || \
+/usr/libexec/PlistBuddy \
+    -c "Set ${PKEY}:UITargetAppPath ${RUNNER_APP}" \
+    "$XCTESTRUN"
+
+/usr/libexec/PlistBuddy \
+    -c "Add ${PKEY}:UITargetAppBundleIdentifier string ${RUNNER_BID}" \
+    "$XCTESTRUN" 2>/dev/null || \
+/usr/libexec/PlistBuddy \
+    -c "Set ${PKEY}:UITargetAppBundleIdentifier ${RUNNER_BID}" \
+    "$XCTESTRUN"
+
+echo "Patch applied."

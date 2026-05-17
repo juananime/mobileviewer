@@ -8,7 +8,7 @@ import 'package:yaml/yaml.dart';
 // ---------------------------------------------------------------------------
 
 Future<void> runStepsFile(String filePath, String deviceId,
-    {bool ios = false}) async {
+    {bool ios = false, String? appIdFallback, bool verbose = false}) async {
   final file = File(filePath);
   if (!await file.exists()) {
     print('Error: file not found — $filePath');
@@ -25,7 +25,7 @@ Future<void> runStepsFile(String filePath, String deviceId,
   }
 
   final header = docs.first as YamlMap?;
-  final appId = header?['appId'] as String?;
+  final appId = header?['appId'] as String? ?? appIdFallback;
   final steps = docs.length > 1 ? docs[1] as YamlList? : null;
 
   if (steps == null || steps.isEmpty) {
@@ -34,7 +34,7 @@ Future<void> runStepsFile(String filePath, String deviceId,
   }
 
   final _Driver driver = ios
-      ? _IosXCTestDriver(udid: deviceId)
+      ? _IosXCTestDriver(udid: deviceId, bundleId: appId, verbose: verbose)
       : _AndroidDriver(deviceId: deviceId);
 
   final runner = _StepRunner(driver: driver, appId: appId, ios: ios);
@@ -238,13 +238,17 @@ class _AndroidDriver implements _Driver {
 
 class _IosXCTestDriver implements _Driver {
   final String udid;
+  final String? bundleId;
+  final bool verbose;
   static const _port = 22087;
 
   Socket? _socket;
   _LineReader? _reader;
   Process? _runnerProcess;
+  // Completes when xcodebuild exits so _connectWithRetry can bail early.
+  final _runnerExited = Completer<int>();
 
-  _IosXCTestDriver({required this.udid});
+  _IosXCTestDriver({required this.udid, this.bundleId, this.verbose = false});
 
   // ---- connection management ----
 
@@ -254,10 +258,19 @@ class _IosXCTestDriver implements _Driver {
     final connected = await _connectWithRetry();
     _socket = connected.$1;
     _reader = connected.$2;
-    // Tell runner which app we're targeting (bundle ID stored per-command)
+    // Send the bundle ID immediately so the runner initialises XCUIApplication
+    // before the first command arrives.
+    if (bundleId != null) {
+      _socket!.write('${jsonEncode({'type': 'connect', 'bundleId': bundleId})}\n');
+      await _reader!.readLine();
+    }
   }
 
   Future<void> _startRunner() async {
+    // Kill any leftover process still holding our port from a previous run.
+    await Process.run('bash',
+        ['-c', 'lsof -ti:$_port | xargs kill -9 2>/dev/null; true']);
+
     final buildDir = _buildDir();
     var xctestrun = _findXctestrun(buildDir);
     if (xctestrun == null) {
@@ -272,11 +285,18 @@ class _IosXCTestDriver implements _Driver {
       '-xctestrun', xctestrun,
       '-destination', 'id=$udid',
     ]);
-    _runnerProcess!.stdout.drain<void>();
-    _runnerProcess!.stderr.drain<void>();
+    if (verbose) {
+      _runnerProcess!.stdout
+          .transform(const SystemEncoding().decoder)
+          .listen(stdout.write);
+      _runnerProcess!.stderr
+          .transform(const SystemEncoding().decoder)
+          .listen(stderr.write);
+    }
+    _runnerProcess!.exitCode.then(_runnerExited.complete);
   }
 
-  static Future<void> _buildRunner(String buildDir) async {
+  Future<void> _buildRunner(String buildDir) async {
     final cwd = Directory.current.path;
     final buildScript = '$cwd/xctest-runner/build.sh';
     if (!File(buildScript).existsSync()) {
@@ -284,16 +304,36 @@ class _IosXCTestDriver implements _Driver {
           'Make sure you run the CLI from the project root.';
     }
     print('XCTest runner not built — building now...');
-    final result = await Process.run('bash', [buildScript],
-        workingDirectory: cwd);
-    if (result.exitCode != 0) {
-      throw 'XCTest runner build failed:\n${result.stderr}';
+    if (verbose) {
+      final process = await Process.start(
+        'bash', [buildScript],
+        workingDirectory: cwd,
+        mode: ProcessStartMode.inheritStdio,
+      );
+      final exitCode = await process.exitCode;
+      if (exitCode != 0) {
+        throw 'XCTest runner build failed (exit $exitCode).';
+      }
+    } else {
+      final result = await Process.run('bash', [buildScript], workingDirectory: cwd);
+      if (result.exitCode != 0) {
+        stderr.write(result.stdout as String);
+        stderr.write(result.stderr as String);
+        throw 'XCTest runner build failed (exit ${result.exitCode}).\n'
+            'Re-run with --verbose for full output.';
+      }
     }
     print('XCTest runner ready.\n');
   }
 
   Future<(Socket, _LineReader)> _connectWithRetry() async {
-    for (var i = 0; i < 30; i++) {
+    for (var i = 0; i < 120; i++) {
+      // If xcodebuild already exited, fail immediately with its exit code.
+      if (_runnerExited.isCompleted) {
+        final code = await _runnerExited.future;
+        throw 'xcodebuild exited with code $code before the TCP server was ready.\n'
+            'Check the xcodebuild output above for the specific error.';
+      }
       try {
         final s = await Socket.connect(
             InternetAddress.loopbackIPv4, _port,
@@ -304,8 +344,8 @@ class _IosXCTestDriver implements _Driver {
         await Future.delayed(const Duration(milliseconds: 500));
       }
     }
-    throw 'Could not connect to XCTest runner on port $_port after 15 s.\n'
-        'Check that the runner built successfully and the simulator is booted.';
+    throw 'Could not connect to XCTest runner on port $_port after 60 s.\n'
+        'Check that the simulator is booted and the runner built successfully.';
   }
 
   Future<Map<String, dynamic>> _send(Map<String, dynamic> cmd) async {

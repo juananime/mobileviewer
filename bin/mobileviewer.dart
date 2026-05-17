@@ -2,18 +2,69 @@ import 'dart:io';
 import 'package:mobileviewer/mobileviewer.dart';
 import 'package:mobileviewer/steps.dart';
 
+void _printHelp() {
+  print('''
+Usage: mobileviewer --ios|--android [options] [flow.yaml]
+
+Platform (required):
+  --ios              Target an iOS simulator
+  --android          Target an Android device or emulator
+
+Options:
+  --app <path>       Path to a .app bundle to install before running (iOS only)
+  --verbose, -v      Stream raw xcodebuild / runner output (hidden by default)
+  --help, -h         Show this help message
+
+Examples:
+  mobileviewer --ios flow.yaml
+  mobileviewer --ios --app MyApp.app flow.yaml
+  mobileviewer --ios --verbose flow.yaml
+  mobileviewer --android flow.yaml
+''');
+}
+
 void main(List<String> arguments) async {
+  if (arguments.contains('--help') || arguments.contains('-h')) {
+    _printHelp();
+    return;
+  }
+
   final isIos = arguments.contains('--ios');
-  final positional =
-      arguments.where((a) => !a.startsWith('--')).toList();
+  final isAndroid = arguments.contains('--android');
+  final isVerbose = arguments.contains('--verbose') || arguments.contains('-v');
+
+  if (!isIos && !isAndroid) {
+    _printHelp();
+    exit(1);
+  }
+
+  // Collect values that follow a named flag (e.g. --app <value>) so they are
+  // not mistaken for positional arguments.
+  final namedArgValues = <String>{};
+  for (var i = 0; i < arguments.length - 1; i++) {
+    if (arguments[i].startsWith('--') && !arguments[i + 1].startsWith('--')) {
+      namedArgValues.add(arguments[i + 1]);
+    }
+  }
+
+  final appArgIndex = arguments.indexOf('--app');
+  final appPath = appArgIndex != -1 && appArgIndex + 1 < arguments.length
+      ? arguments[appArgIndex + 1]
+      : null;
+
+  final positional = arguments
+      .where((a) => !a.startsWith('--') && !namedArgValues.contains(a))
+      .toList();
   final yamlFile =
       positional.firstWhere((a) => a.endsWith('.yaml'), orElse: () => '');
 
   if (isIos) {
-    await _runIos(yamlFile.isNotEmpty ? yamlFile : null);
+    await _runIos(yamlFile.isNotEmpty ? yamlFile : null,
+        appPath: appPath, verbose: isVerbose);
   } else {
     await _runAndroid(yamlFile.isNotEmpty ? yamlFile : null);
   }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -113,7 +164,7 @@ Future<void> _runAndroid(String? yamlFile) async {
 // iOS flow
 // ---------------------------------------------------------------------------
 
-Future<void> _runIos(String? yamlFile) async {
+Future<void> _runIos(String? yamlFile, {String? appPath, bool verbose = false}) async {
   print('Platform: iOS\n');
   print('Checking iOS development tools...\n');
 
@@ -167,9 +218,29 @@ Future<void> _runIos(String? yamlFile) async {
 
   print('');
 
+  // Install the app binary if --app was provided.
+  String? bundleId;
+  if (appPath != null) {
+    print('Installing app: $appPath ...');
+    await installIosApp(target.udid, appPath);
+    bundleId = await extractBundleId(appPath);
+    if (bundleId != null) {
+      print('Bundle ID:      $bundleId');
+    }
+    print('');
+  }
+
   if (yamlFile != null) {
-    await runStepsFile(yamlFile, target.udid, ios: true);
+    await runStepsFile(yamlFile, target.udid,
+        ios: true, appIdFallback: bundleId, verbose: verbose);
     return;
+  }
+
+  // No YAML flow — launch the app directly (if installed) and open Simulator.
+  if (bundleId != null) {
+    print('Launching $bundleId ...');
+    await Process.run('xcrun', ['simctl', 'launch', target.udid, bundleId]);
+    print('');
   }
 
   await openIosSimulatorViewer();

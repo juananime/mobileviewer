@@ -231,3 +231,20 @@ Future<void> openIosSimulatorViewer() async {
   print('Opening Simulator app...\n');
   await Process.run('open', ['-a', 'Simulator']);
 }
+
+Future<void> installIosApp(String udid, String appPath) async {
+  final result = await Process.run('xcrun', ['simctl', 'install', udid, appPath]);
+  if (result.exitCode != 0) {
+    final err = (result.stderr as String).trim();
+    throw 'Failed to install app: ${err.isNotEmpty ? err : 'exit code ${result.exitCode}'}';
+  }
+}
+
+/// Reads CFBundleIdentifier from <app>.app/Info.plist.
+Future<String?> extractBundleId(String appPath) async {
+  final result = await Process.run('/usr/libexec/PlistBuddy',
+      ['-c', 'Print CFBundleIdentifier', '$appPath/Info.plist']);
+  if (result.exitCode != 0) return null;
+  final id = (result.stdout as String).trim();
+  return id.isNotEmpty ? id : null;
+}
