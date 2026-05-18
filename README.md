@@ -31,12 +31,44 @@ cd mobileviewer
 
 # 2. Install Dart dependencies
 dart pub get
-
-# 3. (Optional) Compile to a standalone binary
-dart compile exe bin/mobileviewer.dart -o mobileviewer
 ```
 
-After compiling you can move the `mobileviewer` binary anywhere on your `PATH`.
+---
+
+## Global installation
+
+### Option 1 — compile to a native binary (recommended)
+
+Produces a self-contained executable with no Dart runtime dependency.
+
+```bash
+dart compile exe bin/mobileviewer.dart -o mobileviewer
+sudo mv mobileviewer /usr/local/bin/mobileviewer
+
+# Verify
+mobileviewer --help
+```
+
+### Option 2 — `dart pub global activate`
+
+Installs a wrapper script via the Dart pub cache. Requires Dart to be present on the target machine.
+
+```bash
+# From the project root
+dart pub global activate --source path .
+```
+
+Then ensure `~/.pub-cache/bin` is on your `PATH` (add to `~/.zshrc` if missing):
+
+```bash
+export PATH="$HOME/.pub-cache/bin:$PATH"
+source ~/.zshrc
+
+# Verify
+mobileviewer --help
+```
+
+> **Which to choose?** Option 1 is better for sharing or CI pipelines — the binary runs anywhere without Dart installed. Option 2 is more convenient during development since it always reflects the latest source without recompiling.
 
 ---
 
