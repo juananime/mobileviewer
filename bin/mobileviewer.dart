@@ -2,6 +2,8 @@ import 'dart:io';
 import 'package:mobileviewer/mobileviewer.dart';
 import 'package:mobileviewer/steps.dart';
 
+const _version = '0.0.1';
+
 void _printHelp() {
   print('''
 Usage: mobileviewer --ios|--android [options] [flow.yaml]
@@ -13,6 +15,7 @@ Platform (required):
 Options:
   --app <path>       Path to a .app bundle to install before running (iOS only)
   --verbose, -v      Stream raw xcodebuild / runner output (hidden by default)
+  --version          Print the current version
   --help, -h         Show this help message
 
 Examples:
@@ -26,6 +29,11 @@ Examples:
 void main(List<String> arguments) async {
   if (arguments.contains('--help') || arguments.contains('-h')) {
     _printHelp();
+    return;
+  }
+
+  if (arguments.contains('--version')) {
+    print('mobileviewer $_version');
     return;
   }
 

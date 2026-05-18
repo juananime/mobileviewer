@@ -297,17 +297,13 @@ class _IosXCTestDriver implements _Driver {
   }
 
   Future<void> _buildRunner(String buildDir) async {
-    final cwd = Directory.current.path;
-    final buildScript = '$cwd/xctest-runner/build.sh';
-    if (!File(buildScript).existsSync()) {
-      throw 'Could not find xctest-runner/build.sh.\n'
-          'Make sure you run the CLI from the project root.';
-    }
+    final base = _resolveBase();
+    final buildScript = '$base/xctest-runner/build.sh';
     print('XCTest runner not built — building now...');
     if (verbose) {
       final process = await Process.start(
         'bash', [buildScript],
-        workingDirectory: cwd,
+        workingDirectory: base,
         mode: ProcessStartMode.inheritStdio,
       );
       final exitCode = await process.exitCode;
@@ -315,7 +311,7 @@ class _IosXCTestDriver implements _Driver {
         throw 'XCTest runner build failed (exit $exitCode).';
       }
     } else {
-      final result = await Process.run('bash', [buildScript], workingDirectory: cwd);
+      final result = await Process.run('bash', [buildScript], workingDirectory: base);
       if (result.exitCode != 0) {
         stderr.write(result.stdout as String);
         stderr.write(result.stderr as String);
@@ -468,10 +464,38 @@ class _IosXCTestDriver implements _Driver {
 
   // ---- helpers ----
 
+  // Candidate base directories, in priority order:
+  //   1. next to the binary          → /usr/local/bin/  (global install)
+  //   2. ~/.mobileviewer/            → user-level install
+  //   3. current working directory   → development / project root
+  static List<String> _baseCandidates() {
+    final binDir = File(Platform.resolvedExecutable).parent.path;
+    final home = Platform.environment['HOME'] ?? '';
+    return [binDir, '$home/.mobileviewer', Directory.current.path];
+  }
+
+  // Returns the base that contains pre-built xctest artifacts, or the one
+  // that has the xctest-runner source so we can build.
+  static String _resolveBase() {
+    for (final base in _baseCandidates()) {
+      if (File('$base/xctest-runner/build.sh').existsSync()) return base;
+    }
+    final binDir = File(Platform.resolvedExecutable).parent.path;
+    throw 'Could not find xctest-runner/build.sh.\n'
+        'Place the xctest-runner directory next to the binary:\n'
+        '  cp -r xctest-runner $binDir/';
+  }
+
   static String _buildDir() {
-    // Resolve relative to where the CLI is invoked from
-    final cwd = Directory.current.path;
-    return '$cwd/.build/xctest';
+    // Use the first candidate that already has artifacts, then the first that
+    // has the source (so artifacts land next to it), then fall back to cwd.
+    for (final base in _baseCandidates()) {
+      if (_findXctestrun('$base/.build/xctest') != null) return '$base/.build/xctest';
+    }
+    for (final base in _baseCandidates()) {
+      if (File('$base/xctest-runner/build.sh').existsSync()) return '$base/.build/xctest';
+    }
+    return '${Directory.current.path}/.build/xctest';
   }
 
   static String? _findXctestrun(String buildDir) {
@@ -561,6 +585,7 @@ class _StepRunner {
 
       final label = _stepLabel(type, params);
       stdout.write('  [${i + 1}/${steps.length}] $label ... ');
+      await stdout.flush();
 
       try {
         await _execute(type, params);

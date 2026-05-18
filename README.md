@@ -42,12 +42,26 @@ dart pub get
 Produces a self-contained executable with no Dart runtime dependency.
 
 ```bash
+# 1. Compile the Dart CLI
 dart compile exe bin/mobileviewer.dart -o mobileviewer
 sudo mv mobileviewer /usr/local/bin/mobileviewer
+
+# 2a. Pre-build the iOS XCTest runner and copy the artifacts next to the binary
+#     (recommended — no source files needed on the target machine)
+bash xctest-runner/build.sh
+sudo cp -r .build/xctest /usr/local/bin/.build/
+
+# 2b. Alternatively, copy the xctest-runner source next to the binary
+#     so it builds automatically on first run (requires xcodebuild)
+sudo cp -r xctest-runner /usr/local/bin/
 
 # Verify
 mobileviewer --help
 ```
+
+> **Pre-built vs source:** option 2a is faster (no build step on first run) and keeps the install clean. The built bundle is tied to the Xcode SDK version it was compiled with — after a major Xcode upgrade, delete `/usr/local/bin/.build/xctest` and re-run `bash xctest-runner/build.sh` to rebuild.
+>
+> The binary also checks `~/.mobileviewer/` and the current directory as fallback locations, so all three layouts are supported.
 
 ### Option 2 — `dart pub global activate`
 
